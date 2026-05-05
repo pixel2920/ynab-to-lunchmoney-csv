@@ -45,10 +45,10 @@ cp .env.example .env
    - **Lunch Money API Token**: Get yours at https://my.lunchmoney.app/developers
    - **YNAB API Token** (optional): Get yours at https://app.youneedabudget.com/settings/developer
 
-Optional `.env` settings:
+Optional `.env` settings (currency is normally read from Lunch Money `/me`; set `LUNCHMONEY_CURRENCY` only to override it):
 
 ```bash
-LUNCHMONEY_CURRENCY=sgd
+# LUNCHMONEY_CURRENCY=usd
 LUNCHMONEY_BATCH_SIZE=500
 LUNCHMONEY_RATE_LIMIT_BUFFER=5
 LUNCHMONEY_MAX_RETRIES=5
@@ -81,7 +81,8 @@ python3 ynab_to_lunchmoney.py --dry-run
 Useful options:
 
 ```bash
-python3 ynab_to_lunchmoney.py --file register.csv --currency usd --batch-size 500
+python3 ynab_to_lunchmoney.py --file register.csv --batch-size 500
+python3 ynab_to_lunchmoney.py --file register.csv --currency usd
 ```
 
 The script will:

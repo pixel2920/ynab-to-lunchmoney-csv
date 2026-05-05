@@ -6,6 +6,7 @@ import unittest
 from ynab_to_lunchmoney import (
     build_lunch_money_transactions,
     create_lunch_money_transaction,
+    get_primary_currency,
     process_transactions,
 )
 
@@ -70,6 +71,16 @@ class YnabToLunchMoneyTest(unittest.TestCase):
         self.assertEqual(payload["external_id"], "ynab-csv-123")
         self.assertIn("manual_account_id", payload)
         self.assertNotIn("asset_id", payload)
+
+    def test_get_primary_currency_from_me_endpoint(self):
+        class FakeClient:
+            def get(self, path):
+                self.path = path
+                return {"primary_currency": "USD"}
+
+        client = FakeClient()
+        self.assertEqual(get_primary_currency(client), "usd")
+        self.assertEqual(client.path, "/me")
 
 
 if __name__ == "__main__":

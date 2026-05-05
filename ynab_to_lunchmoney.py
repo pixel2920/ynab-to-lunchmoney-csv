@@ -16,7 +16,7 @@ except ImportError:
 load_dotenv()
 
 DEFAULT_BATCH_SIZE = int(os.getenv("LUNCHMONEY_BATCH_SIZE", "500"))
-DEFAULT_CURRENCY = os.getenv("LUNCHMONEY_CURRENCY", "sgd").lower()
+DEFAULT_CURRENCY = os.getenv("LUNCHMONEY_CURRENCY")
 TRANSFER_CATEGORY_NAME = os.getenv("LUNCHMONEY_TRANSFER_CATEGORY", "Payments & Transfers")
 
 
@@ -157,6 +157,19 @@ def get_existing_tags(client):
         for tag in tags
         if not tag.get("archived_at") and not tag.get("archived")
     }
+
+
+def get_primary_currency(client):
+    payload = client.get("/me")
+    if isinstance(payload, dict):
+        primary_currency = payload.get("primary_currency")
+        if not primary_currency and isinstance(payload.get("user"), dict):
+            primary_currency = payload["user"].get("primary_currency")
+        if primary_currency:
+            return primary_currency.lower()
+
+    print("Could not determine primary currency from Lunch Money; defaulting to USD.")
+    return "usd"
 
 
 def get_or_create_manual_accounts(client, account_names, currency):
@@ -302,7 +315,7 @@ def main():
     parser = argparse.ArgumentParser(description="Migrate YNAB CSV transactions to Lunch Money v2.")
     parser.add_argument("--file", default="register.csv", help="Path to the YNAB register CSV export.")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Transaction insert batch size.")
-    parser.add_argument("--currency", default=DEFAULT_CURRENCY, help="Lunch Money currency code.")
+    parser.add_argument("--currency", default=DEFAULT_CURRENCY, help="Lunch Money currency code. Defaults to your Lunch Money primary currency.")
     parser.add_argument("--limit", type=int, default=None, help="Only process this many CSV rows.")
     parser.add_argument("--offset", type=int, default=0, help="Skip this many CSV rows before processing.")
     parser.add_argument("--dry-run", action="store_true", help="Parse and prepare transactions without API calls.")
@@ -330,6 +343,8 @@ def main():
     print(f"Unique tags: {len(tag_names)}")
 
     if args.dry_run:
+        currency = (args.currency or "usd").lower()
+        print(f"Using currency: {currency.upper()}")
         fake_account_map = {account: index for index, account in enumerate(sorted(accounts), start=1)}
         fake_category_map = {
             category: index for index, category in enumerate(sorted(categories.keys()), start=1)
@@ -337,15 +352,17 @@ def main():
         fake_category_map["_transfer"] = len(fake_category_map) + 1
         fake_tag_map = {tag: index for index, tag in enumerate(sorted(tag_names), start=1)}
         lm_transactions = build_lunch_money_transactions(
-            transactions, fake_account_map, fake_category_map, fake_tag_map, args.currency.lower()
+            transactions, fake_account_map, fake_category_map, fake_tag_map, currency
         )
         print(f"\nDry run complete. Prepared {len(lm_transactions)} transactions; no API calls made.")
         return
 
     client = LunchMoneyClient()
+    currency = (args.currency or get_primary_currency(client)).lower()
+    print(f"Using currency: {currency.upper()}")
 
     print("\n=== Creating/Matching Manual Accounts ===")
-    account_map = get_or_create_manual_accounts(client, accounts, args.currency.lower())
+    account_map = get_or_create_manual_accounts(client, accounts, currency)
 
     print("\n=== Creating/Matching Categories ===")
     category_map = get_or_create_categories(client, categories)
@@ -355,7 +372,7 @@ def main():
 
     print("\n=== Preparing Transactions ===")
     lm_transactions = build_lunch_money_transactions(
-        transactions, account_map, category_map, tag_map, args.currency.lower()
+        transactions, account_map, category_map, tag_map, currency
     )
 
     print(f"\n=== Inserting {len(lm_transactions)} Transactions ===")
