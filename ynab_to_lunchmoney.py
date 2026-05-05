@@ -297,7 +297,6 @@ def insert_transactions(client, lm_transactions, batch_size):
         payload = {
             "transactions": batch,
             "apply_rules": False,
-            "check_for_recurring": False,
             "skip_duplicates": True,
         }
 
