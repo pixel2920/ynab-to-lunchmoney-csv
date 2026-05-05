@@ -1,65 +1,46 @@
 #!/usr/bin/env python3
-import requests
-import os
 import re
-from dotenv import load_dotenv
+
+from lunchmoney_client import LunchMoneyAPIError, LunchMoneyClient, extract_list
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv():
+        return False
+
 
 load_dotenv()
 
-LUNCH_MONEY_TOKEN = os.getenv('LUNCHMONEY_TOKEN')
-BASE_URL = 'https://dev.lunchmoney.app/v1'
-
-headers = {
-    'Authorization': f'Bearer {LUNCH_MONEY_TOKEN}',
-    'Content-Type': 'application/json'
-}
 
 def update_account_types():
-    # Get all assets
-    response = requests.get(f"{BASE_URL}/assets", headers=headers)
-    if response.status_code != 200:
-        print(f"Failed to get assets: {response.text}")
-        return
+    client = LunchMoneyClient()
+    payload = client.get("/manual_accounts")
+    accounts = extract_list(payload, "manual_accounts")
+    print(f"Found {len(accounts)} manual accounts in Lunch Money\n")
 
-    assets = response.json().get('assets', [])
-    print(f"Found {len(assets)} assets in Lunch Money\n")
+    for account in accounts:
+        account_id = account["id"]
+        account_name = account.get("display_name") or account["name"]
+        current_type = account.get("type", "unknown")
 
-    for asset in assets:
-        asset_id = asset['id']
-        asset_name = asset['display_name'] or asset['name']
-        current_type = asset.get('type_name', 'unknown')
-
-        # Check if account name has numbers
-        has_numbers = bool(re.search(r'\d', asset_name))
-
-        if has_numbers:
-            new_type = 'credit'
-        else:
-            new_type = 'cash'  # Default for accounts without numbers
+        has_numbers = bool(re.search(r"\d", account_name))
+        new_type = "credit" if has_numbers else "cash"
 
         if current_type != new_type:
-            print(f"Updating '{asset_name}': {current_type} → {new_type}")
-
-            # Update the asset
-            payload = {
-                'type_name': new_type
-            }
-
-            update_response = requests.put(
-                f"{BASE_URL}/assets/{asset_id}",
-                headers=headers,
-                json=payload
-            )
-
-            if update_response.status_code == 200:
-                print(f"  ✓ Updated successfully")
-            else:
-                print(f"  ✗ Failed: {update_response.text}")
+            print(f"Updating '{account_name}': {current_type} -> {new_type}")
+            client.put(f"/manual_accounts/{account_id}", json={"type": new_type})
+            print("  Updated successfully")
         else:
-            print(f"'{asset_name}': already {current_type} (no change)")
+            print(f"'{account_name}': already {current_type} (no change)")
+
 
 if __name__ == "__main__":
     print("Updating Lunch Money account types...")
-    print("Rule: Accounts with numbers → credit, others → cash\n")
-    update_account_types()
+    print("Rule: Accounts with numbers -> credit, others -> cash\n")
+    try:
+        update_account_types()
+    except LunchMoneyAPIError as exc:
+        print(f"Update failed: {exc}")
+        raise SystemExit(1)
     print("\nDone!")

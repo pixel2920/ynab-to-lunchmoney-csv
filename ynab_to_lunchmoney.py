@@ -1,88 +1,51 @@
 #!/usr/bin/env python3
+import argparse
 import csv
-import json
-import requests
 import os
-import re
-from datetime import datetime
 from collections import defaultdict
-from dotenv import load_dotenv
+
+from lunchmoney_client import LunchMoneyAPIError, LunchMoneyClient, extract_list
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv():
+        return False
+
 
 load_dotenv()
 
-LUNCH_MONEY_TOKEN = os.getenv('LUNCHMONEY_TOKEN')
-BASE_URL = 'https://dev.lunchmoney.app/v1'
+DEFAULT_BATCH_SIZE = int(os.getenv("LUNCHMONEY_BATCH_SIZE", "500"))
+DEFAULT_CURRENCY = os.getenv("LUNCHMONEY_CURRENCY", "sgd").lower()
+TRANSFER_CATEGORY_NAME = os.getenv("LUNCHMONEY_TRANSFER_CATEGORY", "Payments & Transfers")
 
-headers = {
-    'Authorization': f'Bearer {LUNCH_MONEY_TOKEN}',
-    'Content-Type': 'application/json'
-}
 
 def clean_account_name(name):
-    """Keep account name as is, including emojis"""
+    """Keep account name as is, including emojis."""
     return name.strip()
 
+
 def parse_date(date_str):
-    """Convert dd/mm/yyyy to yyyy-mm-dd"""
-    day, month, year = date_str.split('/')
+    """Convert dd/mm/yyyy to yyyy-mm-dd."""
+    day, month, year = date_str.split("/")
     return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
 
-def get_or_create_category(category_name, category_group=None):
-    """Get existing category or create new one"""
-    # First, get all categories
-    response = requests.get(f"{BASE_URL}/categories", headers=headers)
-    if response.status_code == 200:
-        categories = response.json().get('categories', [])
-        for cat in categories:
-            if cat['name'].lower() == category_name.lower():
-                return cat['id']
 
-    # Create new category if not found
-    payload = {
-        'name': category_name[:40],  # Max 40 chars
-        'description': f"From YNAB: {category_group}" if category_group else "From YNAB"
-    }
+def parse_money(value):
+    if not value:
+        return 0.0
+    cleaned = value.replace("$", "").replace(",", "").strip()
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        cleaned = f"-{cleaned[1:-1]}"
+    return float(cleaned)
 
-    response = requests.post(f"{BASE_URL}/categories", headers=headers, json=payload)
-    if response.status_code == 200:
-        return response.json()['category_id']
-    else:
-        print(f"Failed to create category {category_name}: {response.text}")
-        return None
 
-def get_or_create_asset(account_name):
-    """Get existing asset or create new one"""
-    cleaned_name = clean_account_name(account_name)
-
-    # Get existing assets
-    response = requests.get(f"{BASE_URL}/assets", headers=headers)
-    if response.status_code == 200:
-        assets = response.json().get('assets', [])
-        for asset in assets:
-            if asset['name'].lower() == cleaned_name.lower():
-                return asset['id']
-
-    # Create new asset
-    payload = {
-        'type_name': 'cash',
-        'name': cleaned_name,
-        'balance': 0,
-        'currency': 'sgd'
-    }
-
-    response = requests.post(f"{BASE_URL}/assets", headers=headers, json=payload)
-    if response.status_code == 200:
-        return response.json()['id']
-    else:
-        print(f"Failed to create asset {cleaned_name}: {response.text}")
-        return None
-
-def process_transactions(limit=None, offset=0):
-    """Read and process YNAB transactions"""
+def process_transactions(csv_path, limit=None, offset=0):
+    """Read and process YNAB transactions."""
     transactions = []
     transfer_pairs = defaultdict(list)
 
-    with open('register.csv', 'r', encoding='utf-8-sig', errors='ignore') as f:
+    with open(csv_path, "r", encoding="utf-8-sig", errors="ignore") as f:
         reader = csv.DictReader(f)
 
         for i, row in enumerate(reader):
@@ -94,36 +57,32 @@ def process_transactions(limit=None, offset=0):
             if i % 1000 == 0:
                 print(f"  Processing row {i}...")
 
-            # Parse the row
-            account = row['Account']
-            flag = row['Flag']
-            date = parse_date(row['Date'])
-            payee = row['Payee']
-            category_group = row['Category Group']
-            category = row['Category']
-            memo = row['Memo']
-            outflow = float(row['Outflow'].replace('$', '').replace(',', '')) if row['Outflow'] else 0
-            inflow = float(row['Inflow'].replace('$', '').replace(',', '')) if row['Inflow'] else 0
-            cleared = row['Cleared']
-
-            # Determine if it's a transfer
-            is_transfer = payee.startswith('Transfer :')
+            account = row["Account"]
+            flag = row["Flag"]
+            date = parse_date(row["Date"])
+            payee = row["Payee"]
+            category_group = row["Category Group"]
+            category = row["Category"]
+            memo = row["Memo"]
+            outflow = parse_money(row["Outflow"])
+            inflow = parse_money(row["Inflow"])
+            cleared = row["Cleared"]
+            is_transfer = payee.startswith("Transfer :")
 
             transaction = {
-                'account': account,
-                'date': date,
-                'payee': payee,
-                'category': category,
-                'category_group': category_group,
-                'memo': memo,
-                'amount': -outflow if outflow > 0 else inflow,
-                'is_transfer': is_transfer,
-                'flag': flag,
-                'cleared': cleared,
-                'original_index': i
+                "account": account,
+                "date": date,
+                "payee": payee,
+                "category": category,
+                "category_group": category_group,
+                "memo": memo,
+                "amount": -outflow if outflow > 0 else inflow,
+                "is_transfer": is_transfer,
+                "flag": flag,
+                "cleared": cleared,
+                "original_index": i,
             }
 
-            # Group transfers by date and memo for matching
             if is_transfer:
                 transfer_key = f"{date}_{memo}"
                 transfer_pairs[transfer_key].append(transaction)
@@ -132,162 +91,286 @@ def process_transactions(limit=None, offset=0):
 
     return transactions, transfer_pairs
 
-def create_lunch_money_transaction(txn, asset_id, category_id=None):
-    """Create a single transaction in Lunch Money format"""
-    tags = []
-    if txn['flag'] and txn['flag'] not in ['', 'Not Counted']:
-        tags.append(txn['flag'])
 
-    # For Lunch Money, expenses are positive, income is negative
-    # YNAB: outflow is positive (expense), inflow is positive (income)
-    # So we need: outflow -> positive amount, inflow -> negative amount
-    if txn['amount'] < 0:
-        # This was an outflow in YNAB (expense)
-        amount = abs(txn['amount'])
-    else:
-        # This was an inflow in YNAB (income)
-        amount = -abs(txn['amount'])
+def create_lunch_money_transaction(txn, manual_account_id, category_id=None, tag_ids=None, currency=DEFAULT_CURRENCY):
+    tag_ids = tag_ids or []
+
+    # Lunch Money inserts use positive numbers for debits and negative numbers for credits.
+    amount = abs(txn["amount"]) if txn["amount"] < 0 else -abs(txn["amount"])
+    payee = txn["payee"].replace("Transfer : ", "") if txn["is_transfer"] else txn["payee"]
 
     lm_txn = {
-        'date': txn['date'],
-        'amount': amount,
-        'payee': txn['payee'].replace('Transfer : ', '') if txn['is_transfer'] else txn['payee'],
-        'currency': 'sgd',
-        'asset_id': asset_id,
-        'notes': txn['memo'] if txn['memo'] else None,
-        'status': 'cleared' if txn['cleared'] == 'Cleared' else 'uncleared'
+        "date": txn["date"],
+        "amount": amount,
+        "payee": payee,
+        "currency": currency,
+        "manual_account_id": manual_account_id,
+        "notes": txn["memo"] if txn["memo"] else None,
+        "status": "reviewed" if txn["cleared"] == "Cleared" else "unreviewed",
+        "external_id": f"ynab-csv-{txn['original_index']}",
     }
 
     if category_id:
-        lm_txn['category_id'] = category_id
+        lm_txn["category_id"] = category_id
 
-    if tags:
-        lm_txn['tags'] = tags
+    if tag_ids:
+        lm_txn["tag_ids"] = tag_ids
 
     return lm_txn
 
-def main():
-    print("Starting FULL YNAB to Lunch Money migration...")
-    print("Processing ALL transactions...")
-    import sys
-    sys.stdout.flush()
 
-    # Process ALL transactions
-    print("Reading transactions from CSV...")
-    sys.stdout.flush()
-    transactions, transfer_pairs = process_transactions()
-    print(f"Done reading {len(transactions)} transactions")
-    sys.stdout.flush()
+def flatten_categories(categories):
+    flattened = []
+    for category in categories:
+        flattened.append(category)
+        flattened.extend(flatten_categories(category.get("children", [])))
+    return flattened
 
-    print(f"\nFound {len(transactions)} transactions to migrate")
-    print(f"Found {len(transfer_pairs)} potential transfer pairs")
 
-    # Collect unique accounts and categories
-    accounts = set()
-    categories = {}
-
-    for txn in transactions:
-        accounts.add(txn['account'])
-        if txn['category'] and not txn['is_transfer']:
-            categories[txn['category']] = txn['category_group']
-
-    print(f"\nUnique accounts: {len(accounts)}")
-    for acc in accounts:
-        print(f"  - {acc} -> {clean_account_name(acc)}")
-
-    print(f"\nUnique categories: {len(categories)}")
-    for cat, group in categories.items():
-        print(f"  - {cat} (Group: {group})")
-
-    # Create assets in Lunch Money
-    print("\n=== Creating Assets ===")
-    asset_map = {}
+def get_existing_manual_accounts(client):
+    payload = client.get("/manual_accounts")
+    accounts = extract_list(payload, "manual_accounts")
+    account_map = {}
     for account in accounts:
-        asset_id = get_or_create_asset(account)
-        if asset_id:
-            asset_map[account] = asset_id
-            print(f"✓ Created/Found asset: {clean_account_name(account)} (ID: {asset_id})")
-        else:
-            print(f"✗ Failed to create asset: {account}")
+        for name in (account.get("name"), account.get("display_name")):
+            if name:
+                account_map[name.strip().lower()] = account
+    return account_map
 
-    # Create categories
-    print("\n=== Creating Categories ===")
+
+def get_existing_categories(client):
+    payload = client.get("/categories", params={"format": "flattened"})
+    categories = extract_list(payload, "categories")
+    categories = flatten_categories(categories)
+    return {
+        (category.get("name") or "").strip().lower(): category
+        for category in categories
+        if not category.get("is_group")
+    }
+
+
+def get_existing_tags(client):
+    payload = client.get("/tags")
+    tags = extract_list(payload, "tags")
+    return {
+        (tag.get("name") or "").strip().lower(): tag
+        for tag in tags
+        if not tag.get("archived_at") and not tag.get("archived")
+    }
+
+
+def get_or_create_manual_accounts(client, account_names, currency):
+    existing_accounts = get_existing_manual_accounts(client)
+    account_map = {}
+
+    for account_name in sorted(account_names):
+        cleaned_name = clean_account_name(account_name)
+        existing = existing_accounts.get(cleaned_name.lower())
+        if existing:
+            account_map[account_name] = existing["id"]
+            print(f"Found manual account: {cleaned_name} (ID: {existing['id']})")
+            continue
+
+        payload = {
+            "type": "cash",
+            "name": cleaned_name,
+            "balance": 0,
+            "currency": currency,
+            "external_id": f"ynab-csv-account-{cleaned_name.lower()}",
+        }
+        created = client.post("/manual_accounts", json=payload)
+        account_map[account_name] = created["id"]
+        existing_accounts[cleaned_name.lower()] = created
+        print(f"Created manual account: {cleaned_name} (ID: {created['id']})")
+
+    return account_map
+
+
+def get_or_create_categories(client, categories):
+    existing_categories = get_existing_categories(client)
     category_map = {}
 
-    # Always create transfer category
-    transfer_cat_id = get_or_create_category("Payments & Transfers")
-    category_map['_transfer'] = transfer_cat_id
-    print(f"✓ Created/Found transfer category (ID: {transfer_cat_id})")
+    required_categories = {TRANSFER_CATEGORY_NAME: None}
+    required_categories.update(categories)
 
-    for category, group in categories.items():
-        cat_id = get_or_create_category(category, group)
-        if cat_id:
-            category_map[category] = cat_id
-            print(f"✓ Created/Found category: {category} (ID: {cat_id})")
-        else:
-            print(f"✗ Failed to create category: {category}")
+    for category_name, category_group in sorted(required_categories.items()):
+        existing = existing_categories.get(category_name.lower()) or existing_categories.get(category_name[:40].lower())
+        if existing:
+            category_map[category_name] = existing["id"]
+            print(f"Found category: {category_name} (ID: {existing['id']})")
+            continue
 
-    # Prepare transactions for insertion
-    print("\n=== Preparing Transactions ===")
+        payload = {
+            "name": category_name[:40],
+            "description": f"From YNAB: {category_group}" if category_group else "From YNAB",
+        }
+        created = client.post("/categories", json=payload)
+        category_map[category_name] = created["id"]
+        existing_categories[category_name.lower()] = created
+        print(f"Created category: {category_name} (ID: {created['id']})")
+
+    category_map["_transfer"] = category_map[TRANSFER_CATEGORY_NAME]
+    return category_map
+
+
+def get_or_create_tags(client, tag_names):
+    existing_tags = get_existing_tags(client)
+    tag_map = {}
+
+    for tag_name in sorted(tag_names):
+        existing = existing_tags.get(tag_name.lower())
+        if existing:
+            tag_map[tag_name] = existing["id"]
+            print(f"Found tag: {tag_name} (ID: {existing['id']})")
+            continue
+
+        created = client.post("/tags", json={"name": tag_name})
+        tag_map[tag_name] = created["id"]
+        existing_tags[tag_name.lower()] = created
+        print(f"Created tag: {tag_name} (ID: {created['id']})")
+
+    return tag_map
+
+
+def build_lunch_money_transactions(transactions, account_map, category_map, tag_map, currency):
     lm_transactions = []
 
     for txn in transactions:
-        if txn['account'] not in asset_map:
-            print(f"Skipping transaction - no asset mapping for {txn['account']}")
+        if txn["account"] not in account_map:
+            print(f"Skipping transaction - no manual account mapping for {txn['account']}")
             continue
 
-        asset_id = asset_map[txn['account']]
-
-        # Determine category
-        if txn['is_transfer']:
-            category_id = category_map.get('_transfer')
-        elif txn['category']:
-            category_id = category_map.get(txn['category'])
+        if txn["is_transfer"]:
+            category_id = category_map.get("_transfer")
+        elif txn["category"]:
+            category_id = category_map.get(txn["category"])
         else:
             category_id = None
 
-        lm_txn = create_lunch_money_transaction(txn, asset_id, category_id)
+        tag_ids = []
+        if txn["flag"] and txn["flag"] not in ["", "Not Counted"]:
+            tag_id = tag_map.get(txn["flag"])
+            if tag_id:
+                tag_ids.append(tag_id)
+
+        lm_txn = create_lunch_money_transaction(
+            txn,
+            account_map[txn["account"]],
+            category_id=category_id,
+            tag_ids=tag_ids,
+            currency=currency,
+        )
         lm_transactions.append(lm_txn)
 
-        # Only print first few for debugging
         if len(lm_transactions) <= 10:
-            print(f"  {txn['date']} | {txn['payee'][:30]:30} | ${abs(txn['amount']):8.2f} | {txn['account'][:20]}")
+            print(
+                f"  {txn['date']} | {txn['payee'][:30]:30} | "
+                f"${abs(txn['amount']):8.2f} | {txn['account'][:20]}"
+            )
 
-    # Insert transactions in batches of 500 (Lunch Money limit)
-    print(f"\n=== Inserting {len(lm_transactions)} Transactions ===")
+    return lm_transactions
 
-    batch_size = 500
+
+def insert_transactions(client, lm_transactions, batch_size):
     total_inserted = 0
+    total_skipped = 0
+    total_batches = (len(lm_transactions) + batch_size - 1) // batch_size
 
     for i in range(0, len(lm_transactions), batch_size):
-        batch = lm_transactions[i:i+batch_size]
+        batch = lm_transactions[i : i + batch_size]
         batch_num = (i // batch_size) + 1
-        total_batches = (len(lm_transactions) + batch_size - 1) // batch_size
-
-        print(f"  Batch {batch_num}/{total_batches}: Inserting {len(batch)} transactions...")
+        print(f"  Batch {batch_num}/{total_batches}: inserting {len(batch)} transactions...")
 
         payload = {
-            'transactions': batch,
-            'apply_rules': False,
-            'check_for_recurring': False,
-            'debit_as_negative': False
+            "transactions": batch,
+            "apply_rules": False,
+            "check_for_recurring": False,
+            "skip_duplicates": True,
         }
 
-        response = requests.post(f"{BASE_URL}/transactions", headers=headers, json=payload)
+        result = client.post("/transactions", json=payload)
+        inserted = result.get("transactions", [])
+        skipped = result.get("skipped_duplicates", [])
+        total_inserted += len(inserted)
+        total_skipped += len(skipped)
+        print(f"    Inserted {len(inserted)} transactions; skipped {len(skipped)} duplicates")
 
-        if response.status_code == 200:
-            result = response.json()
-            inserted_ids = result.get('ids', [])
-            total_inserted += len(inserted_ids)
-            print(f"    ✓ Successfully inserted {len(inserted_ids)} transactions")
-        else:
-            print(f"    ✗ Failed batch: {response.status_code}")
-            print(f"      Error: {response.text[:200]}")
+    return total_inserted, total_skipped
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Migrate YNAB CSV transactions to Lunch Money v2.")
+    parser.add_argument("--file", default="register.csv", help="Path to the YNAB register CSV export.")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Transaction insert batch size.")
+    parser.add_argument("--currency", default=DEFAULT_CURRENCY, help="Lunch Money currency code.")
+    parser.add_argument("--limit", type=int, default=None, help="Only process this many CSV rows.")
+    parser.add_argument("--offset", type=int, default=0, help="Skip this many CSV rows before processing.")
+    parser.add_argument("--dry-run", action="store_true", help="Parse and prepare transactions without API calls.")
+    args = parser.parse_args()
+
+    print("Starting YNAB to Lunch Money v2 migration...")
+    print(f"Reading transactions from {args.file}...")
+    transactions, transfer_pairs = process_transactions(args.file, limit=args.limit, offset=args.offset)
+    print(f"Done reading {len(transactions)} transactions")
+    print(f"Found {len(transfer_pairs)} potential transfer pairs")
+
+    accounts = set()
+    categories = {}
+    tag_names = set()
+
+    for txn in transactions:
+        accounts.add(txn["account"])
+        if txn["category"] and not txn["is_transfer"]:
+            categories[txn["category"]] = txn["category_group"]
+        if txn["flag"] and txn["flag"] not in ["", "Not Counted"]:
+            tag_names.add(txn["flag"])
+
+    print(f"\nUnique accounts: {len(accounts)}")
+    print(f"Unique categories: {len(categories) + 1}")
+    print(f"Unique tags: {len(tag_names)}")
+
+    if args.dry_run:
+        fake_account_map = {account: index for index, account in enumerate(sorted(accounts), start=1)}
+        fake_category_map = {
+            category: index for index, category in enumerate(sorted(categories.keys()), start=1)
+        }
+        fake_category_map["_transfer"] = len(fake_category_map) + 1
+        fake_tag_map = {tag: index for index, tag in enumerate(sorted(tag_names), start=1)}
+        lm_transactions = build_lunch_money_transactions(
+            transactions, fake_account_map, fake_category_map, fake_tag_map, args.currency.lower()
+        )
+        print(f"\nDry run complete. Prepared {len(lm_transactions)} transactions; no API calls made.")
+        return
+
+    client = LunchMoneyClient()
+
+    print("\n=== Creating/Matching Manual Accounts ===")
+    account_map = get_or_create_manual_accounts(client, accounts, args.currency.lower())
+
+    print("\n=== Creating/Matching Categories ===")
+    category_map = get_or_create_categories(client, categories)
+
+    print("\n=== Creating/Matching Tags ===")
+    tag_map = get_or_create_tags(client, tag_names)
+
+    print("\n=== Preparing Transactions ===")
+    lm_transactions = build_lunch_money_transactions(
+        transactions, account_map, category_map, tag_map, args.currency.lower()
+    )
+
+    print(f"\n=== Inserting {len(lm_transactions)} Transactions ===")
+    total_inserted, total_skipped = insert_transactions(client, lm_transactions, args.batch_size)
 
     print("\n=== Migration Complete ===")
-    print("Please check your Lunch Money account to verify the transactions!")
-    print("\nNote: Transfers are created as separate transactions with 'Payments & Transfers' category.")
+    print(f"Inserted {total_inserted} transactions; skipped {total_skipped} duplicates.")
+    print("Please check your Lunch Money account to verify the transactions.")
+    print("\nNote: Transfers are created as separate transactions with the transfer category.")
     print("You may need to manually link them in Lunch Money if needed.")
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except LunchMoneyAPIError as exc:
+        print(f"Migration failed: {exc}")
+        raise SystemExit(1)
